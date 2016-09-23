@@ -29,6 +29,7 @@
 #include <linux/of_platform.h>
 #include <linux/of_gpio.h>
 #include <linux/spinlock.h>
+#include <linux/pinctrl/consumer.h>
 
 struct gpio_button_data {
 	const struct gpio_keys_button *button;
@@ -44,10 +45,13 @@ struct gpio_button_data {
 
 struct gpio_keys_drvdata {
 	const struct gpio_keys_platform_data *pdata;
+	struct pinctrl *key_pinctrl;
 	struct input_dev *input;
 	struct mutex disable_lock;
 	struct gpio_button_data data[0];
 };
+
+static int onekey_last_state;
 
 /*
  * SYSFS interface for enabling/disabling keys and switches:
@@ -303,18 +307,34 @@ ATTR_STORE_FN(disabled_switches, EV_SW);
  * /sys/devices/platform/gpio-keys/disabled_keys [rw]
  * /sys/devices/platform/gpio-keys/disables_switches [rw]
  */
+/*add by lixh10 change for one key low power 2015-3-11 start */
+static ssize_t switch_onekey_state_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	int state ;
+	state = gpio_get_value_cansleep(922) ;
+
+	return snprintf(buf, PAGE_SIZE, "%d\n",state);
+}
+/*add by lixh10 change for one key low power 2015-3-11 end */
 static DEVICE_ATTR(disabled_keys, S_IWUSR | S_IRUGO,
 		   gpio_keys_show_disabled_keys,
 		   gpio_keys_store_disabled_keys);
 static DEVICE_ATTR(disabled_switches, S_IWUSR | S_IRUGO,
 		   gpio_keys_show_disabled_switches,
 		   gpio_keys_store_disabled_switches);
+/*add by lixh10 change for one key low power 2015-3-11 start */
+static DEVICE_ATTR(onekeypowerdown, S_IWUSR | S_IRUGO,
+		 switch_onekey_state_show, NULL);
+/*add by lixh10 change for one key low power 2015-3-11 end */
 
 static struct attribute *gpio_keys_attrs[] = {
 	&dev_attr_keys.attr,
 	&dev_attr_switches.attr,
 	&dev_attr_disabled_keys.attr,
 	&dev_attr_disabled_switches.attr,
+/*add by lixh10 change for one key low power 2015-3-11 start */
+	&dev_attr_onekeypowerdown.attr,
+/*add by lixh10 change for one key low power 2015-3-11 end */
 	NULL,
 };
 
@@ -333,7 +353,28 @@ static void gpio_keys_gpio_report_event(struct gpio_button_data *bdata)
 		if (state)
 			input_event(input, type, button->code, button->value);
 	} else {
-		input_event(input, type, button->code, !!state);
+/*add by lixh10 change for one key low power 2015-3-11 start */
+		if(button->code == KEY_ONEKEY_UP){
+			if(onekey_last_state!=state){
+				if(state){
+					printk("ahe gpio_key code :  (%d,%d) \n",KEY_ONEKEY_UP,state);
+					input_event(input, EV_KEY, KEY_ONEKEY_UP, !!state);
+					input_sync(input);
+					input_event(input, EV_KEY, KEY_ONEKEY_UP, !state);
+				}else{
+					printk("ahe gpio_key code :  (%d,%d) \n",KEY_ONEKEY_DOWM,state);
+					input_event(input, EV_KEY, KEY_ONEKEY_DOWM, !state);
+					input_sync(input);
+					input_event(input, EV_KEY, KEY_ONEKEY_DOWM, !!state);
+				}
+				onekey_last_state=state;
+			}
+		}else{
+			input_event(input, type, button->code, !!state);
+			printk("ahe gpio_key code :  (%d,%d) \n",button->code,state);
+		}
+
+/*add by lixh10 change for one key low power 2015-3-11 end */
 	}
 	input_sync(input);
 }
@@ -342,7 +383,6 @@ static void gpio_keys_gpio_work_func(struct work_struct *work)
 {
 	struct gpio_button_data *bdata =
 		container_of(work, struct gpio_button_data, work);
-
 	gpio_keys_gpio_report_event(bdata);
 
 	if (bdata->button->wakeup)
@@ -352,7 +392,6 @@ static void gpio_keys_gpio_work_func(struct work_struct *work)
 static void gpio_keys_gpio_timer(unsigned long _data)
 {
 	struct gpio_button_data *bdata = (struct gpio_button_data *)_data;
-
 	schedule_work(&bdata->work);
 }
 
@@ -361,7 +400,6 @@ static irqreturn_t gpio_keys_gpio_isr(int irq, void *dev_id)
 	struct gpio_button_data *bdata = dev_id;
 
 	BUG_ON(irq != bdata->irq);
-
 	if (bdata->button->wakeup)
 		pm_stay_awake(bdata->input->dev.parent);
 	if (bdata->timer_debounce)
@@ -492,8 +530,15 @@ static int gpio_keys_setup_key(struct platform_device *pdev,
 		isr = gpio_keys_irq_isr;
 		irqflags = 0;
 	}
-
+/*add by lixh10 change for one key low power 2015-3-11 start */
+	if(button->code==KEY_ONEKEY_UP){
+		input_set_capability(input, EV_KEY, KEY_ONEKEY_DOWM);
+		input_set_capability(input, EV_KEY, KEY_ONEKEY_UP);
+		onekey_last_state = (gpio_get_value_cansleep(button->gpio) ? 1 : 0) ^ button->active_low;
+		}else{
+/*add by lixh10 change for one key low power 2015-3-11 end */
 	input_set_capability(input, button->type ?: EV_KEY, button->code);
+			}
 
 	/*
 	 * If platform has specified that the button can be disabled,
@@ -522,13 +567,47 @@ static void gpio_keys_report_state(struct gpio_keys_drvdata *ddata)
 {
 	struct input_dev *input = ddata->input;
 	int i;
-
 	for (i = 0; i < ddata->pdata->nbuttons; i++) {
 		struct gpio_button_data *bdata = &ddata->data[i];
 		if (gpio_is_valid(bdata->button->gpio))
 			gpio_keys_gpio_report_event(bdata);
 	}
 	input_sync(input);
+}
+
+static int gpio_keys_pinctrl_configure(struct gpio_keys_drvdata *ddata,
+							bool active)
+{
+	struct pinctrl_state *set_state;
+	int retval;
+
+	if (active) {
+		set_state =
+			pinctrl_lookup_state(ddata->key_pinctrl,
+						"tlmm_gpio_key_active");
+		if (IS_ERR(set_state)) {
+			dev_err(&ddata->input->dev,
+				"cannot get ts pinctrl active state\n");
+			return PTR_ERR(set_state);
+		}
+	} else {
+		set_state =
+			pinctrl_lookup_state(ddata->key_pinctrl,
+						"tlmm_gpio_key_suspend");
+		if (IS_ERR(set_state)) {
+			dev_err(&ddata->input->dev,
+				"cannot get gpiokey pinctrl sleep state\n");
+			return PTR_ERR(set_state);
+		}
+	}
+	retval = pinctrl_select_state(ddata->key_pinctrl, set_state);
+	if (retval) {
+		dev_err(&ddata->input->dev,
+				"cannot set ts pinctrl active state\n");
+		return retval;
+	}
+
+	return 0;
 }
 
 static int gpio_keys_open(struct input_dev *input)
@@ -542,7 +621,6 @@ static int gpio_keys_open(struct input_dev *input)
 		if (error)
 			return error;
 	}
-
 	/* Report current state of buttons that are connected to GPIOs */
 	gpio_keys_report_state(ddata);
 
@@ -599,6 +677,7 @@ gpio_keys_get_devtree_pdata(struct device *dev)
 	pdata->nbuttons = nbuttons;
 
 	pdata->rep = !!of_get_property(node, "autorepeat", NULL);
+	pdata->name = of_get_property(node, "input-name", NULL);
 
 	i = 0;
 	for_each_child_of_node(node, pp) {
@@ -627,12 +706,12 @@ gpio_keys_get_devtree_pdata(struct device *dev)
 		button->active_low = flags & OF_GPIO_ACTIVE_LOW;
 
 		if (of_property_read_u32(pp, "linux,code", &button->code)) {
-			dev_err(dev, "Button without keycode: 0x%x\n",
+			dev_err(dev, "  Button without keycode: 0x%x\n",
 				button->gpio);
 			error = -EINVAL;
 			goto err_free_pdata;
 		}
-
+		dev_err(dev,"ahe key code : (%d,%d)\n",button->code,button->gpio);
 		button->desc = of_get_property(pp, "label", NULL);
 
 		if (of_property_read_u32(pp, "linux,input-type", &button->type))
@@ -690,8 +769,9 @@ static int gpio_keys_probe(struct platform_device *pdev)
 	const struct gpio_keys_platform_data *pdata = dev_get_platdata(dev);
 	struct gpio_keys_drvdata *ddata;
 	struct input_dev *input;
-	int i, error;
+	int i = 0, error;
 	int wakeup = 0;
+	struct pinctrl_state *set_state;
 
 	if (!pdata) {
 		pdata = gpio_keys_get_devtree_pdata(dev);
@@ -731,13 +811,31 @@ static int gpio_keys_probe(struct platform_device *pdev)
 	if (pdata->rep)
 		__set_bit(EV_REP, input->evbit);
 
+	/* Get pinctrl if target uses pinctrl */
+	ddata->key_pinctrl = devm_pinctrl_get(dev);
+	if (IS_ERR(ddata->key_pinctrl)) {
+		if (PTR_ERR(ddata->key_pinctrl) == -EPROBE_DEFER)
+			return -EPROBE_DEFER;
+
+		pr_debug("Target does not use pinctrl\n");
+		ddata->key_pinctrl = NULL;
+	}
+
+	if (ddata->key_pinctrl) {
+		error = gpio_keys_pinctrl_configure(ddata, true);
+		if (error) {
+			dev_err(dev, "cannot set ts pinctrl active state\n");
+			goto fail2;
+		}
+	}
+
 	for (i = 0; i < pdata->nbuttons; i++) {
 		const struct gpio_keys_button *button = &pdata->buttons[i];
 		struct gpio_button_data *bdata = &ddata->data[i];
 
 		error = gpio_keys_setup_key(pdev, input, bdata, button);
 		if (error)
-			goto fail2;
+			goto err_pinctrl;
 
 		if (button->wakeup)
 			wakeup = 1;
@@ -745,14 +843,21 @@ static int gpio_keys_probe(struct platform_device *pdev)
 
 	error = sysfs_create_group(&pdev->dev.kobj, &gpio_keys_attr_group);
 	if (error) {
-		dev_err(dev, "Unable to export keys/switches, error: %d\n",
+		dev_err(dev, "ahe Unable to export keys/switches, error: %d\n",
 			error);
 		goto fail2;
 	}
 
+	
+	if (sysfs_create_link(NULL, &pdev->dev.kobj, "onekeylowpower")) {
+		dev_err(dev, "failed to create sysfs symlink\n");
+		goto fail2;
+	}
+
+
 	error = input_register_device(input);
 	if (error) {
-		dev_err(dev, "Unable to register input device, error: %d\n",
+		dev_err(dev, " Unable to register input device, error: %d\n",
 			error);
 		goto fail3;
 	}
@@ -763,6 +868,16 @@ static int gpio_keys_probe(struct platform_device *pdev)
 
  fail3:
 	sysfs_remove_group(&pdev->dev.kobj, &gpio_keys_attr_group);
+ err_pinctrl:
+	if (ddata->key_pinctrl) {
+		set_state =
+		pinctrl_lookup_state(ddata->key_pinctrl,
+						"tlmm_gpio_key_suspend");
+		if (IS_ERR(set_state))
+			dev_err(dev, "cannot get gpiokey pinctrl sleep state\n");
+		else
+			pinctrl_select_state(ddata->key_pinctrl, set_state);
+	}
  fail2:
 	while (--i >= 0)
 		gpio_remove_key(&ddata->data[i]);
@@ -807,7 +922,15 @@ static int gpio_keys_suspend(struct device *dev)
 {
 	struct gpio_keys_drvdata *ddata = dev_get_drvdata(dev);
 	struct input_dev *input = ddata->input;
-	int i;
+	int i, ret;
+
+	if (ddata->key_pinctrl) {
+		ret = gpio_keys_pinctrl_configure(ddata, false);
+		if (ret) {
+			dev_err(dev, "failed to put the pin in suspend state\n");
+			return ret;
+		}
+	}
 
 	if (device_may_wakeup(dev)) {
 		for (i = 0; i < ddata->pdata->nbuttons; i++) {
@@ -832,6 +955,14 @@ static int gpio_keys_resume(struct device *dev)
 	int error = 0;
 	int i;
 
+	if (ddata->key_pinctrl) {
+		error = gpio_keys_pinctrl_configure(ddata, true);
+		if (error) {
+			dev_err(dev, "failed to put the pin in resume state\n");
+			return error;
+		}
+	}
+
 	if (device_may_wakeup(dev)) {
 		for (i = 0; i < ddata->pdata->nbuttons; i++) {
 			struct gpio_button_data *bdata = &ddata->data[i];
@@ -847,7 +978,6 @@ static int gpio_keys_resume(struct device *dev)
 
 	if (error)
 		return error;
-
 	gpio_keys_report_state(ddata);
 	return 0;
 }
